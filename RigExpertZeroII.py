@@ -128,11 +128,22 @@ class RigExpertZeroII:
     This is an internal method for performing requests that have imemdiate response. 
     """
     def get_immediate_response(self, command, resp_array):
-        self.i2c.writeto(self.ZERO_I2C_ADDR, command)
+        cmd_issued = False
+        n_errors = 0
+        while not cmd_issued:
+            try:
+                self.i2c.writeto(self.ZERO_I2C_ADDR, command)
+                cmd_issued = True
+            except:
+                time.sleep_ms(5)
+                n_errors += 1
+                if n_errors > 100:
+                  break
+        
         resp_OK = False
         tries = 0
 
-        while True:
+        while cmd_issued:
             time.sleep_us(100)
             try:
                 self.i2c.readfrom_into(self.ZERO_I2C_ADDR, resp_array)
@@ -189,8 +200,11 @@ class RigExpertZeroII:
                 frequency = self.MAX_FQ
             self.request_set_fq_get_rx[0] = RigExpertZeroII.CMD_SET_FQ_GET_RX[0]
             self.request_set_fq_get_rx[1:] = frequency.to_bytes(4, "little")
-            self.i2c.writeto(self.ZERO_I2C_ADDR, self.request_set_fq_get_rx)
-            return True
+            try:
+                self.i2c.writeto(self.ZERO_I2C_ADDR, self.request_set_fq_get_rx)
+                return True
+            except:
+              return False
         else:
             return False
        
@@ -202,6 +216,18 @@ class RigExpertZeroII:
     def measure_is_result_ready(self):
         status = self.get_status()
         if status == RigExpertZeroII.ZEROII_STATUS_READY:
+          return True
+        else: 
+          return False
+          
+    """
+    This is the alternative 2-nd method of 3 to asynchronously perform RF measurements. It should be
+    called periodically while it returns True. When it returns False, it means that the board is NOT
+    busy anymore. At this point it is advisable to check if the result is ready or an error occurred.
+    """
+    def measure_is_busy(self):
+        status = self.get_status()
+        if status == RigExpertZeroII.ZEROII_STATUS_BUSY_I2C:
           return True
         else: 
           return False
@@ -231,9 +257,9 @@ class RigExpertZeroII:
     def measure(self, frequency):
         if self.started:
             self.measure_start(frequency)
-            while not self.measure_is_result_ready():
+            while self.measure_is_busy():
               time.sleep_us(500)
-            if self.measure_obtain_result():
+            if self.measure_is_result_ready and self.measure_obtain_result():
               return True
             else:
               return False
