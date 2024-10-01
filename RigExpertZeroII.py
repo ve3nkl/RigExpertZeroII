@@ -40,6 +40,7 @@ class RigExpertZeroII:
     CMD_GET_STATUS     = b'\x5A'
     CMD_SET_FQ_GET_RX  = b'\x6D'
     CMD_GET_SYSTEM_Z0  = b'\xC4'
+    CMD_SET_FQ_GET_RXSWRRL = b'\xA3'
 
     """
     Board status codes
@@ -72,19 +73,19 @@ class RigExpertZeroII:
         self.Z0 = 0
         self.R = 0.0
         self.X = 0.0
-        self.GAMMA = 1
         self.SWR = 200.0
         self.RL = 0
         self.ML = 0
         
         self.started = False
         
+        self.last_status = RigExpertZeroII.ZEROII_STATUS_IDLE
+        
         self.resp_fw_version    = bytearray(7)
         self.resp_get_system_z0 = bytearray(4)
         self.resp_get_status    = bytearray(1)
         self.request_set_fq_get_rx = bytearray(5)
-        self.resp_set_fq_get_rx = bytearray(8)
-
+        self.resp_set_fq_get_rx = bytearray(16)
 
     """
     This method resets the board and makes it ready for performing RF measurements.
@@ -148,6 +149,7 @@ class RigExpertZeroII:
             try:
                 self.i2c.readfrom_into(self.ZERO_I2C_ADDR, resp_array)
                 resp_OK = True
+                self.last_status = RigExpertZeroII.ZEROII_STATUS_IDLE
                 break
             except:
                 tries += 1
@@ -195,13 +197,14 @@ class RigExpertZeroII:
     'frequency' parametr is specified in Hz.
     """    
     def measure_start(self, frequency):
-        if self.started:
+        if self.started and self.last_status == RigExpertZeroII.ZEROII_STATUS_IDLE:
             if frequency > self.MAX_FQ:
                 frequency = self.MAX_FQ
-            self.request_set_fq_get_rx[0] = RigExpertZeroII.CMD_SET_FQ_GET_RX[0]
+            self.request_set_fq_get_rx[0] = RigExpertZeroII.CMD_SET_FQ_GET_RXSWRRL[0]
             self.request_set_fq_get_rx[1:] = frequency.to_bytes(4, "little")
             try:
                 self.i2c.writeto(self.ZERO_I2C_ADDR, self.request_set_fq_get_rx)
+                self.last_status = RigExpertZeroII.ZEROII_STATUS_BUSY_I2C
                 return True
             except:
               return False
@@ -214,7 +217,11 @@ class RigExpertZeroII:
     to be obtained.
     """
     def measure_is_result_ready(self):
-        status = self.get_status()
+        if self.last_status == RigExpertZeroII.ZEROII_STATUS_BUSY_I2C:
+          status = self.get_status()
+          self.last_status = status
+        else:
+          status = self.last_status
         if status == RigExpertZeroII.ZEROII_STATUS_READY:
           return True
         else: 
@@ -226,7 +233,11 @@ class RigExpertZeroII:
     busy anymore. At this point it is advisable to check if the result is ready or an error occurred.
     """
     def measure_is_busy(self):
-        status = self.get_status()
+        if self.last_status == RigExpertZeroII.ZEROII_STATUS_BUSY_I2C:
+          status = self.get_status()
+          self.last_status = status
+        else:
+          status = self.last_status
         if status == RigExpertZeroII.ZEROII_STATUS_BUSY_I2C:
           return True
         else: 
@@ -241,25 +252,32 @@ class RigExpertZeroII:
     def measure_obtain_result(self):
         try:
             self.i2c.readfrom_into(self.ZERO_I2C_ADDR, self.resp_set_fq_get_rx)
-            self.R = struct.unpack('f', self.resp_set_fq_get_rx[0:4])[0]
-            self.X = struct.unpack('f', self.resp_set_fq_get_rx[4:8])[0]
-            self.GAMMA, self.SWR, self.RL, self.ML = self.compute_values()
+            self.R   = struct.unpack('f', self.resp_set_fq_get_rx[0:4])[0]
+            self.X   = struct.unpack('f', self.resp_set_fq_get_rx[4:8])[0]
+            self.SWR = struct.unpack('f', self.resp_set_fq_get_rx[8:12])[0]
+            self.RL  = struct.unpack('f', self.resp_set_fq_get_rx[12:16])[0]
+            w = (self.SWR - 1)/(self.SWR + 1)    
+            self.ML = -10 * log10(1 - w * w)
+            self.last_status = RigExpertZeroII.ZEROII_STATUS_IDLE
             return True
         except:
             return False
     
     """
-    This method is an aletrantive to 3 methods above. It will measuer and obtain a result
+    This method is an aletrantive to 3 methods above. It will measure and obtain a result
     synchronously. It means that it may lock for some time (typically milliseconds). If it
     returns True it means that the result was obtained. To actually access the obtained result
     one of the 'get_obtained_xxx' methods should be called.
     """        
     def measure(self, frequency):
         if self.started:
-            self.measure_start(frequency)
+            if self.measure_start(frequency):
+              time.sleep_ms(20)
+            else:
+              return False
             while self.measure_is_busy():
               time.sleep_us(500)
-            if self.measure_is_result_ready and self.measure_obtain_result():
+            if self.measure_is_result_ready() and self.measure_obtain_result():
               return True
             else:
               return False
@@ -283,35 +301,6 @@ class RigExpertZeroII:
         else:
             return RigExpertZeroII.ZEROII_STATUS_ERROR
     
-    """
-    This is an internal method to compute various RF values. 
-    """    
-    def compute_values(self):
-        Z0 = self.Z0 / 1000.0
-        R  = self.R
-        X  = self.X
-        if R <= 0:    # Replace with a small value
-            R = 0.001
-        denominator = (R + Z0) * (R + Z0) + X * X
-        if denominator > 0:
-            gamma = sqrt(((R - Z0) * (R - Z0) + X * X) / denominator)
-            if gamma < 1.0:
-                swr = (1 + gamma) / (1 - gamma)
-                if swr > 200 or gamma > 0.99:
-                    swr = 200.0
-                elif swr < 1:
-                    swr = 1.0
-            else:
-                swr = 200.0
-                gamma = (swr - 1)/(swr + 1)
-        else:
-            swr = 200
-            gamma = (swr - 1)/(swr + 1)
-            
-        w = (swr-1)/(swr+1)    
-        mismatch_loss = -10 * log10(1 - w * w)
-        return_loss   = -20 * log10(gamma)
-        return (gamma, swr, return_loss, mismatch_loss)
     
     """
     This method can be used to access the measured 'R' value (the real part of the 
